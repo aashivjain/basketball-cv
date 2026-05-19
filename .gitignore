@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments
+.venv/
+venv/
+.env
+
+# Local data and generated artifacts
+data/raw_videos/*
+outputs/*
+runs/
+
+# Keep folder structure
+!data/raw_videos/.gitkeep
+!outputs/tracks/
+!outputs/tracks/.gitkeep
+!outputs/videos/
+!outputs/videos/.gitkeep
+
+# Model weights
+*.pt
+*.onnx
+*.engine
+
+# Notebooks
+.ipynb_checkpoints/

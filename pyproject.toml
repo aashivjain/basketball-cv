@@ -1,0 +1,19 @@
+[project]
+name = "basketball-cv"
+version = "0.1.0"
+description = "Basketball computer vision pipeline for tracking players, ball, and derived game stats."
+requires-python = ">=3.10"
+dependencies = [
+    "opencv-python",
+    "pyyaml",
+    "ultralytics",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

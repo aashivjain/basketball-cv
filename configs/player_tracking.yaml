@@ -1,0 +1,8 @@
+input_video: data/raw_videos/sample.mp4
+model_weights: yolo11n.pt
+tracker: botsort.yaml
+classes:
+  - 0
+confidence: 0.25
+save_video: true
+persist_tracks: true
