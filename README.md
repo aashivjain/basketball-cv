@@ -36,10 +36,16 @@ basketball-cv/
 
 ## Quick Start
 
-Install dependencies in your virtual environment:
+Install runtime requirements in your virtual environment:
 
 ```powershell
-pip install ultralytics opencv-python pyyaml
+pip install -r requirements.txt
+```
+
+For development and tests:
+
+```powershell
+pip install -r requirements-dev.txt
 ```
 
 Place a local video at:
@@ -48,16 +54,23 @@ Place a local video at:
 data/raw_videos/sample.mp4
 ```
 
-Run player tracking:
+Run player tracking using the package entry point:
 
 ```powershell
-python -m basketball_cv.pipelines.track_players --config configs/player_tracking.yaml
+python -m basketball_cv --config configs/player_tracking.yaml
 ```
 
-The legacy script also works:
+The pipeline now produces structured analytics-ready track data in CSV form, for example:
+
+```text
+outputs/player_tracks.csv
+```
+
+Or use the script entry point directly:
 
 ```powershell
 python src/track_players.py
 ```
 
+The package is designed so future work can add structured outputs, court transforms, and event analytics without changing the command-line interface.
 

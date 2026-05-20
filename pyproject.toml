@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "basketball-cv"
 version = "0.1.0"
@@ -13,6 +17,9 @@ dependencies = [
 dev = [
     "pytest",
 ]
+
+[project.scripts]
+basketball-cv = "basketball_cv.pipelines.track_players:main"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

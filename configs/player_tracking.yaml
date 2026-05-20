@@ -1,4 +1,5 @@
 input_video: data/raw_videos/sample.mp4
+output_dir: outputs
 model_weights: yolo11n.pt
 tracker: botsort.yaml
 classes:
@@ -6,3 +7,5 @@ classes:
 confidence: 0.25
 save_video: true
 persist_tracks: true
+save_track_table: true
+track_table_name: player_tracks.csv
