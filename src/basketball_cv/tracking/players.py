@@ -4,7 +4,7 @@ from typing import Any
 
 from basketball_cv.config import PlayerTrackingConfig
 from basketball_cv.detection.yolo import load_yolo_model
-from basketball_cv.tracking.track_data import extract_track_points, save_track_points, convert_video_format
+from basketball_cv.tracking.track_data import extract_track_points, improve_track_consistency, save_track_points, convert_video_format
 
 
 @dataclass(frozen=True)
@@ -46,6 +46,8 @@ def track_players(config: PlayerTrackingConfig) -> TrackResult:
 
     if config.save_track_table:
         track_points = extract_track_points(results)
+        # Improve track ID consistency by bridging gaps and reducing ID flicker
+        track_points = improve_track_consistency(track_points, iou_threshold=0.3, max_gap_frames=2)
         track_table_path = config.output_dir / config.track_table_name
         save_track_points(track_points, track_table_path)
 

@@ -98,6 +98,34 @@ Visual validation of tracking:
 - Track IDs labeled on boxes
 - Same frame count as source video
 
+## Tracking Configuration
+
+### Occlusion & ID Reassignment Improvements
+
+The project implements **post-processing improvements** to reduce ID reassignment when players are occluded:
+
+**Track ID Consistency (`improve_track_consistency`)**
+- **IoU-based matching (IoU > 0.3)**: Matches untracked detections to previous track IDs using spatial overlap
+- **Gap bridging (max 2 frames)**: Reconnects temporary disappearances to maintain player identity through brief occlusions
+- **Appearance matching**: Prioritizes spatial consistency to handle crowded moments
+
+How it works:
+1. Extract raw YOLO tracking results (may have gaps and ID resets)
+2. Post-process to find untracked detections in current frame
+3. Look back up to 2 frames and find best spatial match (highest IoU)
+4. Assign matched detections to previous track IDs
+5. Preserve remaining detections as new tracks
+
+This reduces ID reassignment when:
+- Players go behind teammates (brief 1-2 frame occlusion)
+- YOLO fails to detect a player momentarily
+- Crowded scenes create ambiguous tracking
+
+To adjust behavior, modify parameters in [src/basketball_cv/tracking/players.py](src/basketball_cv/tracking/players.py#L48):
+```python
+improve_track_consistency(track_points, iou_threshold=0.3, max_gap_frames=2)
+```
+
 ### Development
 
 Install dev dependencies:
@@ -112,4 +140,5 @@ Run tests:
 ```powershell
 pytest -v
 ```
+
 
