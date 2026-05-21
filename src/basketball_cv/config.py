@@ -19,6 +19,7 @@ class PlayerTrackingConfig:
     persist_tracks: bool = True
     save_track_table: bool = True
     track_table_name: str = "player_tracks.csv"
+    video_output_format: str = "mp4"
 
     def validate(self) -> None:
         if not self.input_video.exists():
@@ -45,4 +46,5 @@ def load_player_tracking_config(path: str | Path) -> PlayerTrackingConfig:
         persist_tracks=bool(raw_config.get("persist_tracks", True)),
         save_track_table=bool(raw_config.get("save_track_table", True)),
         track_table_name=str(raw_config.get("track_table_name", "player_tracks.csv")),
+        video_output_format=str(raw_config.get("video_output_format", "mp4")),
     )

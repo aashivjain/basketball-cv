@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+import cv2
+
 
 @dataclass(frozen=True)
 class TrackPoint:
@@ -56,7 +58,11 @@ def _to_float_sequence(value: Any) -> tuple[float, ...]:
         for item in value:
             if hasattr(item, "tolist"):
                 item = item.tolist()
-            values.append(float(item))
+            if isinstance(item, (list, tuple)):
+                for sub_item in item:
+                    values.append(float(sub_item))
+            else:
+                values.append(float(item))
         return tuple(values)
     return (float(value),)
 
@@ -162,4 +168,31 @@ def save_track_points(points: Iterable[TrackPoint], output_path: Path) -> Path:
         writer.writeheader()
         for point in points:
             writer.writerow(point.to_dict())
+    return output_path
+
+
+def convert_video_format(input_path: Path, output_path: Path, target_format: str = "mp4") -> Path:
+    if not input_path.exists():
+        raise FileNotFoundError(f"Video file not found: {input_path}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cap = cv2.VideoCapture(str(input_path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Failed to open video: {input_path}")
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    if target_format.lower() == "mp4":
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    elif target_format.lower() == "avi":
+        fourcc = cv2.VideoWriter_fourcc(*"XVID")
+    else:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        out.write(frame)
+    cap.release()
+    out.release()
     return output_path

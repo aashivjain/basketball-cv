@@ -9,3 +9,4 @@ save_video: true
 persist_tracks: true
 save_track_table: true
 track_table_name: player_tracks.csv
+video_output_format: mp4

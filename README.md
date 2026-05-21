@@ -6,9 +6,9 @@ Early-stage basketball computer vision project for processing NBA game footage, 
 
 The project currently supports a first tracking spike with Ultralytics YOLO and a multi-object tracker. The next milestones are:
 
-1. Detect and track players reliably.
-2. Add basketball detection and tracking.
-3. Export frame-level tracks to structured data.
+1. Detect and track players reliably. ✅
+2. Export frame-level tracks to structured data. ✅
+3. Add basketball detection and tracking.
 4. Map image coordinates to court coordinates.
 5. Derive basketball events and stats from tracks.
 6. Build analysis notebooks and visualizations.
@@ -22,55 +22,94 @@ basketball-cv/
     raw_videos/            Local source footage, not committed
   notebooks/               Exploratory analysis
   outputs/
-    tracks/                Generated track data, not committed
-    videos/                Rendered/debug videos, not committed
+    player_tracks.csv      Generated tracking analytics data
   src/
     basketball_cv/
       detection/           Model loading and object detection
       tracking/            Player/ball tracking pipelines
       stats/               Stat and event derivation
       io/                  Video and file I/O helpers
+      pipelines/           CLI entry points
     track_players.py       Backward-compatible script entry point
-  tests/                   Lightweight tests as the project grows
+  tests/                   Unit and integration tests
 ```
 
 ## Quick Start
 
-Install runtime requirements in your virtual environment:
+### 1. Install dependencies
+
+Create a virtual environment and install runtime requirements:
 
 ```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
 
-For development and tests:
+### 2. Prepare your video
 
-```powershell
-pip install -r requirements-dev.txt
-```
-
-Place a local video at:
+Place an NBA court video at:
 
 ```text
 data/raw_videos/sample.mp4
 ```
 
-Run player tracking using the package entry point:
+**Video requirements:**
+- Single camera angle (no cuts or multi-angle footage)
+- Minimum 30 seconds, typically 1-5 minutes for testing
+- Format: MP4, MOV, or AVI
+
+### 3. Run the tracking pipeline
 
 ```powershell
 python -m basketball_cv --config configs/player_tracking.yaml
 ```
 
-The pipeline now produces structured analytics-ready track data in CSV form, for example:
+**What happens:**
+1. YOLO detects players in each frame
+2. Multi-object tracker assigns track IDs across frames
+3. Results saved to `outputs/player_tracks.csv`
+4. Tracked video saved to `runs/detect/outputs/track_players-N/sample.avi`
 
-```text
-outputs/player_tracks.csv
+### Output Files
+
+**`outputs/player_tracks.csv`** — Analytics-ready tracking data
+
+Columns:
+- `frame`: Video frame number
+- `track_id`: Unique player identifier (persistent across frames)
+- `class_id`: Object class (0 = person)
+- `confidence`: Detection confidence (0–1)
+- `x1, y1, x2, y2`: Bounding box coordinates (top-left and bottom-right)
+- `width, height`: Box dimensions
+- `center_x, center_y`: Center point (useful for trajectory analysis)
+
+Example rows:
+```
+frame,track_id,class_id,confidence,x1,y1,x2,y2,width,height,center_x,center_y
+0,1,0,0.614,301.83,315.54,366.18,476.54,64.35,161.00,334.01,396.04
+0,2,0,0.386,126.63,383.36,197.21,486.76,70.58,103.40,161.92,435.06
 ```
 
-Or use the script entry point directly:
+**`runs/detect/outputs/track_players-N/sample.avi`** — Tracked video
+
+Visual validation of tracking:
+- Bounding boxes around each detected player
+- Track IDs labeled on boxes
+- Same frame count as source video
+
+### Development
+
+Install dev dependencies:
 
 ```powershell
-python src/track_players.py
+pip install -r requirements-dev.txt
+pytest
 ```
 
-The package is designed so future work can add structured outputs, court transforms, and event analytics without changing the command-line interface.
+Run tests:
+
+```powershell
+pytest -v
+```
 
