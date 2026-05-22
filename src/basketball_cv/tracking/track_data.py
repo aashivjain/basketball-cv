@@ -3,9 +3,10 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
 import cv2
+import numpy as np
 
 
 @dataclass(frozen=True)
@@ -147,6 +148,69 @@ def extract_track_points(results: Any) -> list[TrackPoint]:
     return points
 
 
+def split_merged_detections(points: list[TrackPoint]) -> list[TrackPoint]:
+    """Split bounding boxes that are likely merging multiple players.
+    
+    If a detection is significantly wider than normal player width, 
+    split it into multiple detections.
+    
+    Args:
+        points: Raw track points from YOLO
+        
+    Returns:
+        Points with merged detections split into individual player boxes
+    """
+    if not points:
+        return points
+
+    # Compute median width from all detections to establish "normal" player size
+    widths = [p.width for p in points if p.width > 10]
+    if not widths:
+        return points
+    
+    widths_sorted = sorted(widths)
+    median_width = widths_sorted[len(widths_sorted) // 2]
+    
+    # Also compute median height for aspect ratio check
+    heights = [p.height for p in points if p.height > 10]
+    median_height = sorted(heights)[len(heights) // 2] if heights else 100
+
+    # Threshold: if width is > 1.7x median, likely merged
+    split_threshold = median_width * 1.7
+    
+    result = []
+    next_split_id = max((p.track_id or 0) for p in points) + 1000  # Avoid ID conflicts
+    
+    for point in points:
+        if point.width <= split_threshold:
+            result.append(point)
+            continue
+        
+        # This box is too wide - split it
+        n_players = max(2, round(point.width / median_width))
+        split_width = point.width / n_players
+        
+        for j in range(n_players):
+            new_x1 = point.x1 + j * split_width
+            new_x2 = new_x1 + split_width
+            
+            # First split keeps original track_id, others get new IDs
+            tid = point.track_id if j == 0 else None
+            
+            result.append(TrackPoint(
+                frame=point.frame,
+                track_id=tid,
+                class_id=point.class_id,
+                confidence=point.confidence * 0.9,  # Slightly lower confidence for splits
+                x1=new_x1,
+                y1=point.y1,
+                x2=new_x2,
+                y2=point.y2,
+            ))
+    
+    return result
+
+
 def _compute_box_iou(box1: TrackPoint, box2: TrackPoint) -> float:
     """Compute IoU (Intersection over Union) between two bounding boxes."""
     x1_inter = max(box1.x1, box2.x1)
@@ -252,6 +316,390 @@ def improve_track_consistency(points: list[TrackPoint], iou_threshold: float = 0
     return sorted(improved_points, key=lambda p: (p.frame, p.track_id or -1))
 
 
+def improve_track_consistency_with_appearance(
+    points: list[TrackPoint], 
+    frames_data: dict[int, np.ndarray],
+    iou_threshold: float = 0.3,
+    max_gap_frames: int = 5,
+    appearance_threshold: float = 0.6
+) -> list[TrackPoint]:
+    """Improve tracking using both spatial and appearance features.
+    
+    Handles two cases:
+    1. Untracked detections (track_id=None) - match to previous tracks
+    2. New IDs that appear near where an old ID disappeared - reassign to old ID
+    
+    Args:
+        points: List of TrackPoint objects
+        frames_data: Dict mapping frame number to frame image (numpy array)
+        iou_threshold: IoU threshold for spatial matching
+        max_gap_frames: Max frames to bridge for disappeared tracks
+        appearance_threshold: Appearance distance threshold (lower = stricter)
+    
+    Returns:
+        Improved track points with stable IDs across crossings
+    """
+    if not points:
+        return points
+    
+    try:
+        from basketball_cv.appearance import extract_appearance, compute_appearance_distance
+    except ImportError:
+        return improve_track_consistency(points, iou_threshold, max_gap_frames)
+    
+    sorted_points = sorted(points, key=lambda p: (p.frame, p.track_id or -1))
+    
+    # Group points by frame
+    frame_points: dict[int, list[TrackPoint]] = {}
+    for point in sorted_points:
+        if point.frame not in frame_points:
+            frame_points[point.frame] = []
+        frame_points[point.frame].append(point)
+    
+    frames = sorted(frame_points.keys())
+    
+    # --- Phase 1: Build track history and detect ID switches ---
+    # Track when each ID was last seen and where
+    track_last_seen: dict[int, tuple[int, TrackPoint]] = {}  # track_id -> (frame, point)
+    track_first_seen: dict[int, int] = {}  # track_id -> first frame
+    
+    for frame_num in frames:
+        for pt in frame_points[frame_num]:
+            if pt.track_id is not None:
+                track_last_seen[pt.track_id] = (frame_num, pt)
+                if pt.track_id not in track_first_seen:
+                    track_first_seen[pt.track_id] = frame_num
+    
+    # --- Phase 2: Identify ID reassignments ---
+    # A new ID appearing where an old ID just disappeared is likely the same player
+    id_mapping: dict[int, int] = {}  # new_id -> should_be_id
+    
+    # Cache appearance features
+    appearance_cache: dict[tuple[int, int, int, int], Any] = {}
+    
+    def get_appearance_for_point(frame_num: int, pt: TrackPoint):
+        key = (frame_num, int(pt.x1), int(pt.y1), int(pt.x2))
+        if key not in appearance_cache:
+            if frame_num not in frames_data:
+                return None
+            try:
+                feat = extract_appearance(frames_data[frame_num], (pt.x1, pt.y1, pt.x2, pt.y2))
+                appearance_cache[key] = feat
+            except Exception:
+                return None
+        return appearance_cache.get(key)
+    
+    # For each frame, check if new IDs match recently-disappeared old IDs
+    active_tracks: dict[int, tuple[int, TrackPoint]] = {}  # id -> (last_frame, last_point)
+    
+    for i, frame_num in enumerate(frames):
+        current_ids = set()
+        current_points_by_id: dict[int, TrackPoint] = {}
+        
+        for pt in frame_points[frame_num]:
+            if pt.track_id is not None:
+                current_ids.add(pt.track_id)
+                current_points_by_id[pt.track_id] = pt
+        
+        # Find new IDs in this frame (first appearance)
+        new_ids_this_frame = [
+            tid for tid in current_ids 
+            if track_first_seen.get(tid) == frame_num
+        ]
+        
+        # Find recently disappeared IDs
+        disappeared_ids = {}
+        for tid, (last_frame, last_pt) in active_tracks.items():
+            if tid not in current_ids and (frame_num - last_frame) <= max_gap_frames:
+                disappeared_ids[tid] = (last_frame, last_pt)
+        
+        # Try to match new IDs to disappeared IDs
+        for new_id in new_ids_this_frame:
+            if new_id in id_mapping:
+                continue
+            
+            new_pt = current_points_by_id[new_id]
+            best_match_id = None
+            best_score = 0
+            
+            for old_id, (old_frame, old_pt) in disappeared_ids.items():
+                if old_id in id_mapping.values():
+                    continue  # Already remapped
+                
+                # Spatial proximity (center distance)
+                dist = _compute_center_distance(new_pt, old_pt)
+                frame_gap = frame_num - old_frame
+                # Allow more distance for larger gaps (player moved)
+                max_dist = 80 + frame_gap * 40
+                
+                if dist > max_dist:
+                    continue
+                
+                # IoU check (may be 0 if player moved, so use distance as primary)
+                iou = _compute_box_iou(new_pt, old_pt)
+                
+                # Appearance check
+                feat_new = get_appearance_for_point(frame_num, new_pt)
+                feat_old = get_appearance_for_point(old_frame, old_pt)
+                
+                appearance_sim = 0.5
+                if feat_new and feat_old:
+                    app_dist = compute_appearance_distance(feat_new, feat_old)
+                    appearance_sim = 1.0 - min(1.0, app_dist)
+                
+                # Combined score: spatial proximity + appearance + IoU
+                proximity_score = max(0, 1.0 - dist / max_dist)
+                combined = 0.4 * appearance_sim + 0.35 * proximity_score + 0.25 * iou
+                
+                if combined > best_score and combined > 0.35:
+                    best_score = combined
+                    best_match_id = old_id
+            
+            if best_match_id is not None:
+                id_mapping[new_id] = best_match_id
+        
+        # Update active tracks
+        for tid, pt in current_points_by_id.items():
+            active_tracks[tid] = (frame_num, pt)
+    
+    # --- Phase 3: Apply ID mapping and handle untracked points ---
+    improved_points: list[TrackPoint] = []
+    
+    for i, frame_num in enumerate(frames):
+        current_detections = frame_points[frame_num]
+        
+        for pt in current_detections:
+            if pt.track_id is None:
+                # Try to match untracked to nearby recent tracks
+                best_match = None
+                best_score = 0
+                
+                for lookback in range(1, min(max_gap_frames + 1, i + 1)):
+                    prev_frame = frames[i - lookback]
+                    for prev_pt in frame_points[prev_frame]:
+                        if prev_pt.track_id is None:
+                            continue
+                        
+                        dist = _compute_center_distance(pt, prev_pt)
+                        if dist > 120:
+                            continue
+                        
+                        iou = _compute_box_iou(pt, prev_pt)
+                        feat_cur = get_appearance_for_point(frame_num, pt)
+                        feat_prev = get_appearance_for_point(prev_frame, prev_pt)
+                        
+                        appearance_sim = 0.5
+                        if feat_cur and feat_prev:
+                            app_dist = compute_appearance_distance(feat_cur, feat_prev)
+                            appearance_sim = 1.0 - min(1.0, app_dist)
+                        
+                        score = 0.5 * appearance_sim + 0.3 * iou + 0.2 * max(0, 1 - dist / 120)
+                        if score > best_score and score > 0.35:
+                            best_score = score
+                            # Apply ID mapping if the matched ID was remapped
+                            matched_id = prev_pt.track_id
+                            best_match = id_mapping.get(matched_id, matched_id)
+                    
+                    if best_match is not None:
+                        break
+                
+                improved_points.append(TrackPoint(
+                    frame=pt.frame,
+                    track_id=best_match,
+                    class_id=pt.class_id,
+                    confidence=pt.confidence,
+                    x1=pt.x1, y1=pt.y1, x2=pt.x2, y2=pt.y2,
+                ))
+            else:
+                # Apply ID mapping for reassigned IDs
+                mapped_id = id_mapping.get(pt.track_id, pt.track_id)
+                if mapped_id != pt.track_id:
+                    improved_points.append(TrackPoint(
+                        frame=pt.frame,
+                        track_id=mapped_id,
+                        class_id=pt.class_id,
+                        confidence=pt.confidence,
+                        x1=pt.x1, y1=pt.y1, x2=pt.x2, y2=pt.y2,
+                    ))
+                else:
+                    improved_points.append(pt)
+    
+    return sorted(improved_points, key=lambda p: (p.frame, p.track_id or -1))
+
+
+def consolidate_track_ids(
+    points: list[TrackPoint],
+    frames_data: dict[int, np.ndarray],
+    max_gap_frames: int = 10,
+    max_distance: float = 150.0,
+) -> list[TrackPoint]:
+    """Consolidate fragmented track IDs that belong to the same player.
+    
+    If two track IDs never co-exist in the same frame AND are spatially/appearance
+    similar when one ends and the other begins, merge them into one ID.
+    
+    Args:
+        points: Track points (already improved by appearance matching)
+        frames_data: Dict of frame images
+        max_gap_frames: Maximum frame gap to consider for merging
+        max_distance: Maximum center distance to consider merging
+    
+    Returns:
+        Points with consolidated IDs (fewer unique IDs)
+    """
+    if not points:
+        return points
+    
+    try:
+        from basketball_cv.appearance import extract_appearance, compute_appearance_distance
+    except ImportError:
+        return points
+    
+    # Build per-track info: frame range, positions, appearance
+    track_info: dict[int, dict] = {}  # track_id -> {first_frame, last_frame, points, ...}
+    
+    for pt in points:
+        if pt.track_id is None:
+            continue
+        tid = pt.track_id
+        if tid not in track_info:
+            track_info[tid] = {
+                'first_frame': pt.frame,
+                'last_frame': pt.frame,
+                'first_point': pt,
+                'last_point': pt,
+                'count': 0,
+            }
+        info = track_info[tid]
+        info['count'] += 1
+        if pt.frame < info['first_frame']:
+            info['first_frame'] = pt.frame
+            info['first_point'] = pt
+        if pt.frame >= info['last_frame']:
+            info['last_frame'] = pt.frame
+            info['last_point'] = pt
+    
+    # Find which tracks co-exist (appear in same frame)
+    frame_ids: dict[int, set[int]] = {}
+    for pt in points:
+        if pt.track_id is None:
+            continue
+        if pt.frame not in frame_ids:
+            frame_ids[pt.frame] = set()
+        frame_ids[pt.frame].add(pt.track_id)
+    
+    coexist: set[tuple[int, int]] = set()
+    for frame_num, ids in frame_ids.items():
+        ids_list = list(ids)
+        for a in range(len(ids_list)):
+            for b in range(a + 1, len(ids_list)):
+                pair = (min(ids_list[a], ids_list[b]), max(ids_list[a], ids_list[b]))
+                coexist.add(pair)
+    
+    # Build merge candidates: tracks that DON'T co-exist and are temporally close
+    all_ids = sorted(track_info.keys())
+    merge_map: dict[int, int] = {}  # new_id -> canonical_id
+    
+    # Sort tracks by first appearance
+    sorted_ids = sorted(all_ids, key=lambda tid: track_info[tid]['first_frame'])
+    
+    for i, tid_b in enumerate(sorted_ids):
+        if tid_b in merge_map:
+            continue
+        
+        info_b = track_info[tid_b]
+        best_merge = None
+        best_score = 0
+        
+        # Look for earlier tracks that ended before this one started
+        for tid_a in sorted_ids[:i]:
+            # Get canonical ID for tid_a
+            canonical_a = tid_a
+            while canonical_a in merge_map:
+                canonical_a = merge_map[canonical_a]
+            
+            info_a = track_info[tid_a]
+            
+            # Check temporal constraint: tid_a ended before tid_b started (with gap)
+            gap = info_b['first_frame'] - info_a['last_frame']
+            if gap < 0 or gap > max_gap_frames:
+                continue
+            
+            # Check they don't co-exist
+            pair = (min(canonical_a, tid_b), max(canonical_a, tid_b))
+            if pair in coexist:
+                continue
+            
+            # Check spatial proximity
+            dist = _compute_center_distance(info_a['last_point'], info_b['first_point'])
+            if dist > max_distance:
+                continue
+            
+            # Appearance check
+            feat_a = None
+            feat_b = None
+            if info_a['last_frame'] in frames_data:
+                try:
+                    pt_a = info_a['last_point']
+                    feat_a = extract_appearance(
+                        frames_data[info_a['last_frame']], 
+                        (pt_a.x1, pt_a.y1, pt_a.x2, pt_a.y2)
+                    )
+                except Exception:
+                    pass
+            if info_b['first_frame'] in frames_data:
+                try:
+                    pt_b = info_b['first_point']
+                    feat_b = extract_appearance(
+                        frames_data[info_b['first_frame']], 
+                        (pt_b.x1, pt_b.y1, pt_b.x2, pt_b.y2)
+                    )
+                except Exception:
+                    pass
+            
+            appearance_sim = 0.5
+            if feat_a and feat_b:
+                app_dist = compute_appearance_distance(feat_a, feat_b)
+                appearance_sim = 1.0 - min(1.0, app_dist)
+            
+            # Score based on proximity, appearance, and gap
+            proximity_score = max(0, 1.0 - dist / max_distance)
+            gap_score = max(0, 1.0 - gap / max_gap_frames)
+            combined = 0.4 * appearance_sim + 0.35 * proximity_score + 0.25 * gap_score
+            
+            if combined > best_score and combined > 0.4:
+                best_score = combined
+                best_merge = canonical_a
+        
+        if best_merge is not None:
+            merge_map[tid_b] = best_merge
+    
+    # Resolve transitive merges: if A->B and B->C, then A->C
+    def resolve(tid):
+        visited = set()
+        while tid in merge_map and tid not in visited:
+            visited.add(tid)
+            tid = merge_map[tid]
+        return tid
+    
+    # Apply merges
+    result = []
+    for pt in points:
+        if pt.track_id is not None and pt.track_id in merge_map:
+            canonical = resolve(pt.track_id)
+            result.append(TrackPoint(
+                frame=pt.frame,
+                track_id=canonical,
+                class_id=pt.class_id,
+                confidence=pt.confidence,
+                x1=pt.x1, y1=pt.y1, x2=pt.x2, y2=pt.y2,
+            ))
+        else:
+            result.append(pt)
+    
+    return sorted(result, key=lambda p: (p.frame, p.track_id or -1))
+
+
 def save_track_points(points: Iterable[TrackPoint], output_path: Path) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
@@ -274,6 +722,69 @@ def save_track_points(points: Iterable[TrackPoint], output_path: Path) -> Path:
         for point in points:
             writer.writerow(point.to_dict())
     return output_path
+
+
+def filter_crowd_and_low_confidence(
+    points: list[TrackPoint],
+    frames_data: dict[int, np.ndarray],
+    confidence_threshold: float = 0.15,
+    filter_crowd: bool = True
+) -> list[TrackPoint]:
+    """Filter out crowd members and low-confidence detections.
+    
+    Args:
+        points: List of track points
+        frames_data: Dict mapping frame number to frame image
+        confidence_threshold: Minimum confidence to keep (0-1)
+        filter_crowd: Whether to apply crowd filtering
+        
+    Returns:
+        Filtered list of track points
+    """
+    if not filter_crowd:
+        # Just filter by confidence
+        return [p for p in points if p.confidence >= confidence_threshold]
+    
+    try:
+        from basketball_cv.appearance import filter_crowd_detections
+    except ImportError:
+        # Fallback to confidence-only filtering
+        return [p for p in points if p.confidence >= confidence_threshold]
+    
+    filtered = []
+    
+    # Group by frame for batch processing
+    frame_points: dict[int, list[TrackPoint]] = {}
+    for point in points:
+        if point.frame not in frame_points:
+            frame_points[point.frame] = []
+        frame_points[point.frame].append(point)
+    
+    # Filter each frame
+    for frame_num, points_in_frame in frame_points.items():
+        if frame_num not in frames_data:
+            # Can't filter without frame data, keep all
+            filtered.extend(points_in_frame)
+            continue
+        
+        frame = frames_data[frame_num]
+        
+        # Get bounding boxes
+        bboxes = [(p.x1, p.y1, p.x2, p.y2) for p in points_in_frame]
+        
+        try:
+            # Identify crowd members
+            crowd_indices = filter_crowd_detections(frame, bboxes)
+            crowd_set = set(crowd_indices)
+        except Exception:
+            crowd_set = set()
+        
+        # Keep points that pass confidence and are not crowd
+        for idx, point in enumerate(points_in_frame):
+            if point.confidence >= confidence_threshold and idx not in crowd_set:
+                filtered.append(point)
+    
+    return filtered
 
 
 def convert_video_format(input_path: Path, output_path: Path, target_format: str = "mp4") -> Path:

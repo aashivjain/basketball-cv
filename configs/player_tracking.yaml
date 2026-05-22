@@ -1,6 +1,6 @@
 input_video: data/raw_videos/sample.mp4
 output_dir: outputs
-model_weights: yolo11n.pt
+model_weights: yolo11l.pt
 tracker: botsort.yaml
 classes:
   - 0
