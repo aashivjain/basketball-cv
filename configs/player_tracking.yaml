@@ -1,12 +1,41 @@
 input_video: data/raw_videos/sample.mp4
 output_dir: outputs
 model_weights: yolo11l.pt
-tracker: botsort.yaml
+tracker: configs/botsort_basketball.yaml
 classes:
   - 0
-confidence: 0.25
+confidence: 0.3
 save_video: true
 persist_tracks: true
 save_track_table: true
 track_table_name: player_tracks.csv
 video_output_format: mp4
+
+# Court calibration: map video pixel coords to court feet coords.
+# Court coordinate system: origin at near-side baseline corner,
+# X-axis along court length (0-94 ft), Y-axis along court width (0-50 ft).
+# Use scripts/calibrate_court.py to generate these interactively.
+court_calibration:
+  video_points:
+    # [pixel_x, pixel_y] in video frame (1280x720)
+    # Paint corners (most reliable - clearly visible purple rectangle)
+    - [260, 490]   # Near-side paint corner at baseline
+    - [350, 253]   # Far-side paint corner at baseline
+    - [535, 462]   # Near-side free-throw line corner
+    - [577, 263]   # Far-side free-throw line corner
+    # Three-point line baseline intersections
+    - [185, 545]   # Near 3pt straight meets baseline
+    - [325, 200]   # Far 3pt straight meets baseline
+    # Additional landmarks
+    - [720, 360]   # Top of 3pt arc (front of basket)
+    - [1020, 345]  # Center of center circle (half-court)
+  court_points:
+    # [x_feet, y_feet] on NBA court
+    - [0, 17]      # Paint: baseline x near-side paint edge
+    - [0, 33]      # Paint: baseline x far-side paint edge
+    - [19, 17]     # FT line x near-side paint edge
+    - [19, 33]     # FT line x far-side paint edge
+    - [0, 3]       # 3pt straight meets baseline (near sideline)
+    - [0, 47]      # 3pt straight meets baseline (far sideline)
+    - [29, 25]     # Top of 3pt arc (directly in front of basket)
+    - [47, 25]     # Center of center circle (half-court)

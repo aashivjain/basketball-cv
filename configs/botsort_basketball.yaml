@@ -1,0 +1,22 @@
+# Custom BoT-SORT config optimized for basketball player tracking.
+# Key changes from default:
+#   - track_buffer: 60 (keep lost tracks alive during overlaps - default is 30)
+#   - new_track_thresh: 0.35 (slightly harder to create new tracks vs 0.25 default)
+#   - match_thresh: 0.85 (slightly more permissive to retain IDs)
+
+tracker_type: botsort
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+new_track_thresh: 0.35
+track_buffer: 60
+match_thresh: 0.85
+fuse_score: True
+
+# Global motion compensation (helps with camera movement)
+gmc_method: sparseOptFlow
+
+# ReID disabled - auto model doesn't help for basketball
+proximity_thresh: 0.5
+appearance_thresh: 0.25
+with_reid: False
+model: auto

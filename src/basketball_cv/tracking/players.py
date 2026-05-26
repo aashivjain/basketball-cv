@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 
 from basketball_cv.config import PlayerTrackingConfig
+from basketball_cv.court import CourtMapper
 from basketball_cv.detection.yolo import load_yolo_model
 from basketball_cv.tracking.track_data import (
     extract_track_points,
@@ -42,9 +43,13 @@ def track_players(config: PlayerTrackingConfig) -> TrackResult:
     if config.save_track_table:
         track_points = extract_track_points(results)
         
-        # Save raw tracking data (no broken post-processing)
+        # Save raw tracking data
         track_table_path = config.output_dir / config.track_table_name
         save_track_points(track_points, track_table_path)
+
+        # Build court mapper (auto-detects paint per-frame)
+        court_mapper = CourtMapper()
+        print("Court mapper initialized (per-frame paint detection).")
 
         # Render video with bounding boxes and court overlay
         if config.save_video:
@@ -53,6 +58,7 @@ def track_players(config: PlayerTrackingConfig) -> TrackResult:
                 input_video=config.input_video,
                 output_path=rendered_video_path,
                 track_points=track_points,
+                court_mapper=court_mapper,
             )
             print(f"Rendered video: {rendered_video_path}")
 
