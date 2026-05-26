@@ -8,6 +8,7 @@ import numpy as np
 from basketball_cv.config import PlayerTrackingConfig
 from basketball_cv.court import CourtMapper
 from basketball_cv.detection.yolo import load_yolo_model
+from basketball_cv.tracking.ball import BallTracker
 from basketball_cv.tracking.track_data import (
     extract_track_points,
     save_track_points,
@@ -51,7 +52,17 @@ def track_players(config: PlayerTrackingConfig) -> TrackResult:
         court_mapper = CourtMapper()
         print("Court mapper initialized (per-frame paint detection).")
 
-        # Render video with bounding boxes and court overlay
+        # Track the ball (separate prediction pass, COCO class 32)
+        ball_tracker = BallTracker(confidence=0.1)
+        ball_detections = ball_tracker.track(model, config.input_video)
+        found = sum(1 for d in ball_detections if d is not None)
+        interp = sum(1 for d in ball_detections if d is not None and d.interpolated)
+        print(
+            f"Ball tracking: {found} frames with position "
+            f"({found - interp} detected, {interp} interpolated)."
+        )
+
+        # Render video with bounding boxes, court overlay, and ball
         if config.save_video:
             rendered_video_path = config.output_dir / "tracked_with_court.mp4"
             render_tracked_video(
@@ -59,6 +70,7 @@ def track_players(config: PlayerTrackingConfig) -> TrackResult:
                 output_path=rendered_video_path,
                 track_points=track_points,
                 court_mapper=court_mapper,
+                ball_detections=ball_detections,
             )
             print(f"Rendered video: {rendered_video_path}")
 

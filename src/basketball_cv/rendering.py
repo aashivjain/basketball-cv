@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+from collections import deque
 from pathlib import Path
 
 import cv2
 import numpy as np
 
 from basketball_cv.tracking.track_data import TrackPoint
+from basketball_cv.tracking.ball import BallDetection
 from basketball_cv.court import CourtMapper
+
+# Orange (BGR) for ball trail/dot
+_BALL_COLOR = (0, 140, 255)
+_BALL_TRAIL_LEN = 15
 
 # Distinct colors for track IDs (BGR)
 _COLORS = [
@@ -94,6 +100,7 @@ def render_tracked_video(
     output_path: str | Path,
     track_points: list[TrackPoint],
     court_mapper: CourtMapper | None = None,
+    ball_detections: list[BallDetection | None] | None = None,
 ) -> Path:
     """Render video with bounding boxes and court overlay.
 
@@ -101,6 +108,7 @@ def render_tracked_video(
     - Full NBA court overlay (top-right corner)
     - Player foot positions mapped via homography to court coordinates
     - Dots only on court (no trails) for clean visualization
+    - Ball position with fading trail (orange)
     """
     input_video = Path(input_video)
     output_path = Path(output_path)
@@ -128,6 +136,9 @@ def render_tracked_video(
     court_w, court_h = 300, 161
     base_court = _draw_full_court(court_w, court_h)
 
+    # Ball trail: deque of (cx, cy) pixel positions
+    ball_trail: deque[tuple[int, int]] = deque(maxlen=_BALL_TRAIL_LEN)
+
     frame_idx = 0
     while True:
         ret, frame = cap.read()
@@ -135,6 +146,11 @@ def render_tracked_video(
             break
 
         detections = frame_tracks.get(frame_idx, [])
+        ball_det = (
+            ball_detections[frame_idx]
+            if ball_detections and frame_idx < len(ball_detections)
+            else None
+        )
 
         # Detect court paint and update mapping for this frame
         if court_mapper is not None:
@@ -150,6 +166,30 @@ def render_tracked_video(
             cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
             cv2.putText(frame, label, (x1 + 2, y1 - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+
+        # --- Ball trail + ball dot on main video ---
+        if ball_det is not None:
+            ball_trail.append((int(ball_det.center_x), int(ball_det.center_y)))
+
+        trail_list = list(ball_trail)
+        for i, (tx, ty) in enumerate(trail_list):
+            # Oldest = i=0, newest = i=len-1; fade size + colour
+            frac = (i + 1) / _BALL_TRAIL_LEN
+            r = max(3, int(9 * frac))
+            b = int(_BALL_COLOR[0] * frac)
+            g = int(_BALL_COLOR[1] * frac)
+            rv = int(_BALL_COLOR[2] * frac)
+            cv2.circle(frame, (tx, ty), r + 2, (0, 0, 0), -1, cv2.LINE_AA)
+            cv2.circle(frame, (tx, ty), r, (b, g, rv), -1, cv2.LINE_AA)
+
+        # Current ball: prominent circle with outline
+        if ball_det is not None:
+            bx, by = int(ball_det.center_x), int(ball_det.center_y)
+            cv2.circle(frame, (bx, by), 11, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.circle(frame, (bx, by), 10, _BALL_COLOR, -1, cv2.LINE_AA)
+            if not ball_det.interpolated:
+                # White highlight dot for confirmed detections
+                cv2.circle(frame, (bx - 3, by - 3), 2, (255, 255, 255), -1, cv2.LINE_AA)
 
         # --- Court overlay with player dots ---
         court_img = base_court.copy()
@@ -178,6 +218,16 @@ def render_tracked_video(
                 color = _color_for(pt.track_id)
                 cv2.circle(court_img, (cx, cy), 5, color, -1, cv2.LINE_AA)
                 cv2.circle(court_img, (cx, cy), 5, (255, 255, 255), 1, cv2.LINE_AA)
+
+        # Ball dot on court overlay
+        if court_mapper is not None and ball_det is not None:
+            ball_court = court_mapper.transform_foot_position(
+                ball_det.center_x, ball_det.center_y
+            )
+            if ball_court is not None:
+                bcx, bcy = int(ball_court[0]), int(ball_court[1])
+                cv2.circle(court_img, (bcx, bcy), 5, (0, 0, 0), -1, cv2.LINE_AA)
+                cv2.circle(court_img, (bcx, bcy), 4, _BALL_COLOR, -1, cv2.LINE_AA)
 
         # Blend court overlay onto frame (top-right)
         ox = vid_w - court_w - 10
