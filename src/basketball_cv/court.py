@@ -1,11 +1,9 @@
-"""Per-frame court detection and coordinate mapping.
+"""Court coordinate mapping via per-frame paint detection.
 
-Detects the basketball court paint (key) via color segmentation in each frame,
-then uses the paint's 4 corners as anchor points to compute a homography
-mapping player positions to 2D court coordinates.
-
-This approach is robust to camera panning since it detects the court
-in every frame independently.
+Instead of a one-time calibration, we detect the purple paint rectangle in
+every frame using HSV segmentation.  The four corners of the detected rectangle
+map to known NBA dimensions, giving us a fresh homography each frame that stays
+accurate even when the camera pans.
 """
 
 from __future__ import annotations
@@ -41,10 +39,11 @@ RIGHT_PAINT_COURT = np.array([
 
 
 class CourtMapper:
-    """Per-frame court mapper using paint detection.
+    """Translates video pixel positions to court overlay coordinates.
 
-    Detects the purple paint rectangle in each frame via HSV color segmentation,
-    then computes a homography from the detected corners to known court coordinates.
+    On each frame, call ``detect_and_update()`` to re-detect the paint and
+    recompute the homography, then use ``transform_foot_position()`` to map
+    any pixel to the mini-court overlay.
     """
 
     def __init__(
@@ -74,7 +73,8 @@ class CourtMapper:
         """
         corners, is_left = _detect_paint_corners(frame)
         if corners is None:
-            # Use last good mapping if available
+            # Fall back to the last working homography so the overlay
+            # doesn't go blank on frames where detection misses.
             if self._last_good_matrix is not None:
                 self._current_matrix = self._last_good_matrix
             return False
@@ -91,8 +91,9 @@ class CourtMapper:
             for pt in court_feet
         ], dtype=np.float32)
 
-        # Compute homography from detected pixel corners → court overlay pixels
-        # Use direct least-squares (fast) since paint corners are clean and reliable
+        # Compute homography: detected pixel corners → court overlay pixels.
+        # Direct least-squares is fine here — the paint corners are clean
+        # enough that RANSAC doesn't add anything.
         H, _ = cv2.findHomography(corners, court_overlay)
         if H is None:
             if self._last_good_matrix is not None:
@@ -130,11 +131,13 @@ class CourtMapper:
 
 
 def _detect_paint_corners(frame: np.ndarray) -> tuple[np.ndarray | None, bool | None]:
-    """Detect the basketball paint (key) rectangle via purple color segmentation.
+    """Find the four corners of the basketball paint in *frame*.
 
-    Returns:
-        (corners, is_left): 4x2 array of ordered corners [TL, TR, BR, BL]
-        and whether it's the left paint. Returns (None, None) if not detected.
+    Uses HSV color segmentation to isolate the purple paint, then fits a
+    quadrilateral to the largest matching contour.
+
+    Returns ``(corners, is_left)`` where corners is a 4×2 array ordered
+    [TL, TR, BR, BL], or ``(None, None)`` if nothing was found.
     """
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
@@ -153,15 +156,14 @@ def _detect_paint_corners(frame: np.ndarray) -> tuple[np.ndarray | None, bool | 
     if not contours:
         return None, None
 
-    # Find the largest contour that's paint-shaped
+    # Find the largest contour that looks like the paint rectangle
     best_contour = None
     best_area = 0
     for c in contours:
         area = cv2.contourArea(c)
         if area < 5000:
             continue
-        # Check aspect ratio of bounding rect - paint should be wider than tall
-        # in a broadcast side-view
+        # Paint should be noticeably wider than it is tall from a broadcast angle
         x, y, w, h = cv2.boundingRect(c)
         aspect = w / max(h, 1)
         if 1.5 < aspect < 8.0 and area > best_area:

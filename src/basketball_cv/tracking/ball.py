@@ -1,11 +1,8 @@
-"""Ball detection and tracking for basketball video analysis.
+"""Ball detection and tracking.
 
-Uses YOLO (COCO class 32 = sports ball) for per-frame detection, then applies:
-  1. Per-frame: best-confidence detection only (one ball in play)
-  2. Motion filter: drop implausible jumps between frames
-  3. Linear interpolation: fill short gaps between valid detections
-
-Inspired by: https://github.com/abdullahtarek/basketball_analysis
+Runs a second YOLO pass (class 32 = sports ball) over the video, keeps the
+best-confidence hit per frame, removes physically impossible jumps, then
+fills remaining gaps via linear interpolation.
 """
 
 from __future__ import annotations
@@ -18,10 +15,20 @@ import numpy as np
 # COCO class index for "sports ball"
 _BALL_CLASS_ID = 32
 
-# Max pixels the ball centre can move per frame gap before the detection
-# is considered a false positive.  Basketball broadcast footage is typically
-# 1280×720; a fast pass covers ~30 px/frame at 30 fps.
+# How far (px) the ball centre is allowed to move between frames.
+# A hard pass at 30 fps typically travels ~25-30 px; 40 gives some headroom.
 _MAX_PX_PER_FRAME = 40
+
+# A valid in-play ball should usually be close to at least one player's box.
+_MAX_PLAYER_ASSOC_DIST = 135.0
+
+# If a detection is far from all players, only keep it when confidence is high.
+_MIN_UNSUPPORTED_CONF = 0.55
+
+# Only fill gaps shorter than this. A ball that vanishes for more than
+# ~12 frames has likely changed hands or moved off-frame; connecting two
+# distant detections with a straight line would look worse than no ball.
+_MAX_INTERPOLATION_GAP = 12
 
 
 @dataclass
@@ -50,52 +57,38 @@ class BallDetection:
 
 
 class BallTracker:
-    """Detect and track the basketball across all video frames.
+    """Handles the full ball tracking pipeline for a single video.
 
-    Pipeline
-    --------
-    1. YOLO predict (class 32 = sports ball) streaming over the video.
-    2. Keep the single highest-confidence detection per frame.
-    3. Motion filter: remove detections that jump farther than
-       ``_MAX_PX_PER_FRAME * gap_frames`` pixels.
-    4. Linear interpolation between surviving detections.
-
-    Usage
-    -----
-    >>> tracker = BallTracker(confidence=0.1)
-    >>> positions = tracker.track(model, "video.mp4")
+    Call ``track()`` once per video — it runs YOLO ball detection, filters
+    out noisy detections by checking inter-frame movement, then interpolates
+    the remaining gaps so you get a smooth position for almost every frame.
     """
 
     def __init__(self, confidence: float = 0.1) -> None:
-        # Low threshold because COCO-trained models underestimate confidence
-        # for small basketballs.  Motion filtering removes false positives.
+        # Keep the threshold low — COCO ball detection is sketchy on broadcast
+        # footage, so we'd rather over-detect and filter than miss the ball.
         self.confidence = confidence
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
     def track(
-        self, model: object, video_path: str | Path
+        self,
+        model: object,
+        video_path: str | Path,
+        player_centers_by_frame: dict[int, list[tuple[float, float]]] | None = None,
     ) -> list[BallDetection | None]:
-        """Run full ball tracking pipeline on *video_path*.
+        """Return a per-frame list of ball positions for *video_path*.
 
-        Returns a list indexed by frame number.  ``None`` means no ball
-        position is available for that frame (beyond the range of
-        detections, or detection failed everywhere).
+        Entries are ``None`` for frames where no position could be
+        established (before the first detection or after the last).
         """
         raw = self._detect(model, video_path)
         filtered = self._filter_by_motion(raw)
+        filtered = self._filter_by_player_context(filtered, player_centers_by_frame)
         return self._interpolate(filtered)
-
-    # ------------------------------------------------------------------
-    # Pipeline stages
-    # ------------------------------------------------------------------
 
     def _detect(
         self, model: object, video_path: str | Path
     ) -> list[BallDetection | None]:
-        """Run YOLO and keep the best detection per frame."""
+        """Predict on the full video and return the top detection per frame."""
         detections: list[BallDetection | None] = []
         frame_idx = 0
 
@@ -130,7 +123,7 @@ class BallTracker:
     def _filter_by_motion(
         self, detections: list[BallDetection | None]
     ) -> list[BallDetection | None]:
-        """Drop detections that are physically implausible given prior position."""
+        """Discard detections that jump too far from the previous known position."""
         result: list[BallDetection | None] = list(detections)
         last_valid_idx = -1
 
@@ -162,34 +155,35 @@ class BallTracker:
     def _interpolate(
         self, detections: list[BallDetection | None]
     ) -> list[BallDetection | None]:
-        """Fill gaps with linear interpolation (reference repo technique)."""
+        """Fill gaps between detections using linear interpolation.
+
+        Gaps longer than ``_MAX_INTERPOLATION_GAP`` frames are left as None
+        rather than drawing a fake path between distant detections.
+        """
+        result = list(detections)
         n = len(detections)
         if n == 0:
-            return detections
+            return result
 
-        xs = np.array([d.center_x if d else np.nan for d in detections])
-        ys = np.array([d.center_y if d else np.nan for d in detections])
-        rs = np.array([d.radius if d else np.nan for d in detections])
+        # Find all valid detection indices
+        valid_indices = [i for i, d in enumerate(detections) if d is not None]
+        if len(valid_indices) < 2:
+            return result
 
-        valid_mask = ~np.isnan(xs)
-        if valid_mask.sum() < 2:
-            return detections
+        # Walk consecutive pairs of valid detections and only fill the gap
+        # if it's short enough to be believable.
+        for a, b in zip(valid_indices, valid_indices[1:]):
+            gap = b - a
+            if gap <= 1 or gap > _MAX_INTERPOLATION_GAP:
+                continue
 
-        frames = np.arange(n)
-        valid_frames = frames[valid_mask]
-        first_valid = int(valid_frames[0])
-        last_valid = int(valid_frames[-1])
-
-        # Interpolate only within the range covered by real detections
-        xs_i = np.interp(frames, valid_frames, xs[valid_mask])
-        ys_i = np.interp(frames, valid_frames, ys[valid_mask])
-        rs_i = np.interp(frames, valid_frames, rs[valid_mask])
-
-        result = list(detections)
-        for i in range(first_valid, last_valid + 1):
-            if detections[i] is None:
-                r = max(9.0, float(rs_i[i]))
-                cx, cy = float(xs_i[i]), float(ys_i[i])
+            det_a = detections[a]
+            det_b = detections[b]
+            for i in range(a + 1, b):
+                t = (i - a) / gap
+                cx = det_a.center_x + t * (det_b.center_x - det_a.center_x)
+                cy = det_a.center_y + t * (det_b.center_y - det_a.center_y)
+                r = max(9.0, det_a.radius + t * (det_b.radius - det_a.radius))
                 result[i] = BallDetection(
                     frame=i,
                     x1=cx - r,
@@ -199,5 +193,56 @@ class BallTracker:
                     confidence=0.0,
                     interpolated=True,
                 )
+
+        return result
+
+    def _filter_by_player_context(
+        self,
+        detections: list[BallDetection | None],
+        player_centers_by_frame: dict[int, list[tuple[float, float]]] | None,
+    ) -> list[BallDetection | None]:
+        """Reject detections that are far from players unless strongly supported.
+
+        This avoids drawing a phantom ball when the real ball goes out of frame
+        and YOLO locks on to an unrelated object.
+        """
+        if not player_centers_by_frame:
+            return detections
+
+        result = list(detections)
+        last_supported_idx = -1
+
+        for i, det in enumerate(result):
+            if det is None:
+                continue
+
+            centers = player_centers_by_frame.get(i, [])
+            if centers:
+                min_player_dist = min(
+                    float(np.hypot(det.center_x - px, det.center_y - py))
+                    for px, py in centers
+                )
+            else:
+                min_player_dist = float("inf")
+
+            close_to_player = min_player_dist <= _MAX_PLAYER_ASSOC_DIST
+            if close_to_player:
+                last_supported_idx = i
+                continue
+
+            # If not near any player, keep only if confidence is high and
+            # motion remains smooth relative to the last supported detection.
+            strong_confidence = det.confidence >= _MIN_UNSUPPORTED_CONF
+            smooth_from_last = False
+            if last_supported_idx >= 0 and result[last_supported_idx] is not None:
+                prev = result[last_supported_idx]
+                gap = i - last_supported_idx
+                motion = float(np.hypot(det.center_x - prev.center_x, det.center_y - prev.center_y))
+                smooth_from_last = motion <= (_MAX_PX_PER_FRAME * gap)
+
+            if not (strong_confidence and smooth_from_last):
+                result[i] = None
+            else:
+                last_supported_idx = i
 
         return result

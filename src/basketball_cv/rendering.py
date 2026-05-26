@@ -1,4 +1,4 @@
-"""Video renderer with tracking annotations and court overlay using homography."""
+"""Renders the output video: bounding boxes, player IDs, court overlay, and ball trail."""
 
 from __future__ import annotations
 
@@ -14,7 +14,11 @@ from basketball_cv.court import CourtMapper
 
 # Orange (BGR) for ball trail/dot
 _BALL_COLOR = (0, 140, 255)
-_BALL_TRAIL_LEN = 15
+_BALL_TRAIL_LEN = 6
+# Bright yellow indicator for the player currently holding the ball
+_CARRIER_COLOR = (0, 220, 255)
+_CARRIER_HOLD_FRAMES = 8
+_CARRIER_SWITCH_CONFIRM_FRAMES = 2
 
 # Distinct colors for track IDs (BGR)
 _COLORS = [
@@ -35,6 +39,34 @@ _COLORS = [
 
 def _color_for(track_id: int) -> tuple[int, int, int]:
     return _COLORS[track_id % len(_COLORS)]
+
+
+def _find_ball_carrier(
+    detections: list[TrackPoint],
+    ball_det: BallDetection | None,
+    max_dist_px: float = 110.0,
+) -> int | None:
+    """Return the track_id of the player closest to the ball.
+
+    Returns None if no player is within *max_dist_px* of the ball center,
+    which typically means the ball is in the air or being passed.
+    """
+    if ball_det is None or not detections:
+        return None
+
+    bx, by = ball_det.center_x, ball_det.center_y
+    best_id: int | None = None
+    best_dist = max_dist_px
+
+    for pt in detections:
+        px = (pt.x1 + pt.x2) / 2.0
+        py = (pt.y1 + pt.y2) / 2.0
+        dist = float(np.hypot(bx - px, by - py))
+        if dist < best_dist:
+            best_dist = dist
+            best_id = pt.track_id
+
+    return best_id
 
 
 def _draw_full_court(width: int, height: int) -> np.ndarray:
@@ -102,13 +134,10 @@ def render_tracked_video(
     court_mapper: CourtMapper | None = None,
     ball_detections: list[BallDetection | None] | None = None,
 ) -> Path:
-    """Render video with bounding boxes and court overlay.
+    """Write an annotated copy of *input_video* to *output_path*.
 
-    - Color-coded bounding boxes with ID labels
-    - Full NBA court overlay (top-right corner)
-    - Player foot positions mapped via homography to court coordinates
-    - Dots only on court (no trails) for clean visualization
-    - Ball position with fading trail (orange)
+    Draws colour-coded player bounding boxes, a court mini-map in the
+    top-right corner with player dot positions, and an orange ball trail.
     """
     input_video = Path(input_video)
     output_path = Path(output_path)
@@ -139,6 +168,12 @@ def render_tracked_video(
     # Ball trail: deque of (cx, cy) pixel positions
     ball_trail: deque[tuple[int, int]] = deque(maxlen=_BALL_TRAIL_LEN)
 
+    # Carrier state with hysteresis so indicator does not flicker.
+    active_carrier_id: int | None = None
+    carrier_missing_frames = 0
+    pending_carrier_id: int | None = None
+    pending_carrier_frames = 0
+
     frame_idx = 0
     while True:
         ret, frame = cap.read()
@@ -156,16 +191,61 @@ def render_tracked_video(
         if court_mapper is not None:
             court_mapper.detect_and_update(frame)
 
+        candidate_carrier_id = _find_ball_carrier(detections, ball_det)
+        present_ids = {pt.track_id for pt in detections if pt.track_id is not None}
+
+        if candidate_carrier_id is not None:
+            carrier_missing_frames = 0
+            if candidate_carrier_id == active_carrier_id:
+                pending_carrier_id = None
+                pending_carrier_frames = 0
+            else:
+                if candidate_carrier_id == pending_carrier_id:
+                    pending_carrier_frames += 1
+                else:
+                    pending_carrier_id = candidate_carrier_id
+                    pending_carrier_frames = 1
+
+                if pending_carrier_frames >= _CARRIER_SWITCH_CONFIRM_FRAMES:
+                    active_carrier_id = candidate_carrier_id
+                    pending_carrier_id = None
+                    pending_carrier_frames = 0
+        else:
+            pending_carrier_id = None
+            pending_carrier_frames = 0
+            carrier_missing_frames += 1
+            if carrier_missing_frames > _CARRIER_HOLD_FRAMES:
+                active_carrier_id = None
+
+        # If the tracked carrier is currently out of frame, avoid showing stale UI.
+        if active_carrier_id not in present_ids:
+            if carrier_missing_frames > _CARRIER_HOLD_FRAMES:
+                active_carrier_id = None
+
+        carrier_id = active_carrier_id
+
         # --- Bounding boxes ---
         for pt in detections:
             color = _color_for(pt.track_id)
+            has_ball = pt.track_id == carrier_id
             x1, y1, x2, y2 = int(pt.x1), int(pt.y1), int(pt.x2), int(pt.y2)
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3 if has_ball else 2)
             label = f"#{pt.track_id}"
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
             cv2.rectangle(frame, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
             cv2.putText(frame, label, (x1 + 2, y1 - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
+
+            if has_ball:
+                # Downward-pointing triangle above the player's label
+                cx = (x1 + x2) // 2
+                tip_y = y1 - th - 8
+                tri = np.array(
+                    [[cx - 7, tip_y - 11], [cx + 7, tip_y - 11], [cx, tip_y]],
+                    dtype=np.int32,
+                )
+                cv2.fillPoly(frame, [tri], _CARRIER_COLOR)
+                cv2.polylines(frame, [tri], True, (0, 0, 0), 1, cv2.LINE_AA)
 
         # --- Ball trail + ball dot on main video ---
         if ball_det is not None:
@@ -173,14 +253,14 @@ def render_tracked_video(
 
         trail_list = list(ball_trail)
         for i, (tx, ty) in enumerate(trail_list):
-            # Oldest = i=0, newest = i=len-1; fade size + colour
+            # i=0 is oldest; scale size and color intensity toward the current frame
             frac = (i + 1) / _BALL_TRAIL_LEN
             r = max(3, int(9 * frac))
-            b = int(_BALL_COLOR[0] * frac)
-            g = int(_BALL_COLOR[1] * frac)
-            rv = int(_BALL_COLOR[2] * frac)
+            b_ch = int(_BALL_COLOR[0] * frac)
+            g_ch = int(_BALL_COLOR[1] * frac)
+            r_ch = int(_BALL_COLOR[2] * frac)
             cv2.circle(frame, (tx, ty), r + 2, (0, 0, 0), -1, cv2.LINE_AA)
-            cv2.circle(frame, (tx, ty), r, (b, g, rv), -1, cv2.LINE_AA)
+            cv2.circle(frame, (tx, ty), r, (b_ch, g_ch, r_ch), -1, cv2.LINE_AA)
 
         # Current ball: prominent circle with outline
         if ball_det is not None:

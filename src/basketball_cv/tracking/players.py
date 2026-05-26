@@ -52,9 +52,22 @@ def track_players(config: PlayerTrackingConfig) -> TrackResult:
         court_mapper = CourtMapper()
         print("Court mapper initialized (per-frame paint detection).")
 
+        # Precompute player centers by frame for ball plausibility checks.
+        player_centers_by_frame: dict[int, list[tuple[float, float]]] = {}
+        for pt in track_points:
+            if pt.track_id is None:
+                continue
+            player_centers_by_frame.setdefault(pt.frame, []).append(
+                ((pt.x1 + pt.x2) / 2.0, (pt.y1 + pt.y2) / 2.0)
+            )
+
         # Track the ball (separate prediction pass, COCO class 32)
         ball_tracker = BallTracker(confidence=0.1)
-        ball_detections = ball_tracker.track(model, config.input_video)
+        ball_detections = ball_tracker.track(
+            model,
+            config.input_video,
+            player_centers_by_frame=player_centers_by_frame,
+        )
         found = sum(1 for d in ball_detections if d is not None)
         interp = sum(1 for d in ball_detections if d is not None and d.interpolated)
         print(
